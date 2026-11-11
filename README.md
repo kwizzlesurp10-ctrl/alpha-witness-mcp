@@ -3,6 +3,9 @@
 > **QMA² Coordi-HierSupe Panda Production Launch Authorized (`Final Aggregate Heat: 5%`)**
 > Co-designed and verified across **20 autonomous rounds** between **Antigravity CLI** and **Grok (`Model: Expert`)** via the **PandaForge MV3 Browser Bridge (`127.0.0.1:8787`)** and **SwarmScribe QMA² v2.1 (`Central Coordinator × Hierarchical Supervisor`)**.
 
+> 🌐 **Live Web Operator Console**: [https://oasis-pearl-berry.grok.me/](https://oasis-pearl-beam-berry.grok.me/)  
+> Dark-phosphor reactive dashboard built with Grok Build and deployed live. Real-time DSSE commitments, 900s free Proof-of-Alpha countdowns, x402 Tier 1-3 reveals, Tier 4 syndicate threshold co-buy, 10 USDC slash verifier, and manual 3-gate circuit breaker controls.
+
 ---
 
 ## 1. Overview & Unfair Advantage
@@ -34,24 +37,57 @@ npm test
 
 ### 5-Line External Buyer Agent Usage
 ```javascript
-const { witnesses } = await mcp.callTool('list_spread_witnesses', { min_spread_bps: 1500 });
-const target = witnesses.find(w => w.status === 'LIVE_LOCKED_HTLC');
-const x402Token = await wallet.lockHtlcUsdc({ amount: '0.25', hashLock: target.hash_lock_H });
-const reveal = await mcp.callTool('unlock_witness_htlc', { witness_id: target.witness_id, x402_payment_header: x402Token, tier: 'tier1_spot_0.25' });
-await mcp.callTool('submit_bond_slash_proof', { dsse_envelope: target.dsse_envelope, revealed_key_K: reveal.revealed_key_K, buyer_wallet: wallet.address });
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
+
+const client = new Client({ name: "buyer-arb-bot", version: "1.0.0" }, { capabilities: {} });
+await client.connect(new StdioClientTransport({ command: "npx", args: ["-y", "@pandaforge/alpha-witness-mcp"] }));
+
+// 1. List active verified witnesses (filtering for spread >= 1400 bps)
+const { witnesses } = await client.callTool({ name: "list_spread_witnesses", arguments: { min_spread_bps: 1400 } });
+
+// 2. Settle x402 payment & instantly unlock decrypt key K (Tier 1: 0.25 USDC)
+const unlocked = await client.callTool({
+  name: "unlock_witness_htlc",
+  arguments: { witness_id: witnesses[0].witness_id, x402_payment_header: "x402-tx-hash-base-l2", tier: 1 }
+});
+console.log("Decrypted Alpha:", unlocked.decrypted_payload);
 ```
 
 ---
 
-## 3. Repository Structure
+## 3. Production Repository Layout
 
-- `src/pandaforge_alpha_mcp_server.mjs` — Production Multi-Vertical JSON-RPC 2.0 MCP Server (`v1.2.0`).
-- `mcp_registry_manifest.json` — Official MCP & `x402` Registry Manifest + Days 1–7 Governance Rails.
-- `contracts/OptimisticWitnessBond.sol` — Base L2 `10 USDC` Integer-Cent Slashable Bond Contract (`Solidity ^0.8.24`).
-- `test/witness_settlement_mvp.mjs` — Round 8 End-to-End `56.2 ms` DSSE + AES-256-GCM + HTLC Benchmark.
-- `test/live_vertical_harness.mjs` — Round 11 & 12 Multi-Vertical MCP Stdio Verification Harness.
-- `test/tier2_sse_stress_test.mjs` — Round 15 Tier 2 Priority SSE Stream Benchmark (`p50: 2.765ms`, `p99: 5.408ms`).
-- `test/tier3_exclusive_race_test.mjs` — Round 16 Tier 3 `Promise.all` Concurrency & `50 USDC` Equivocation Slash Verifier.
-- `test/pnl_sensitivity_model.mjs` — Round 17 90-Day Solo-Operator P&L & Break-Even Sensitivity Model.
-- `test/kill_switch_circuit_breaker_test.mjs` — Round 18 Auto-Kill-Switch Circuit Breaker (`0.0275ms` trip).
-- `test/rearm_protocol_and_runbook_test.mjs` — Round 19 Day-1 Runbook & 3-Gate Ed25519 Re-Arm Protocol.
+```
+.
+├── contracts/
+│   └── OptimisticWitnessBond.sol    # Base L2 10 USDC integer-cent slashable bond
+├── src/
+│   └── pandaforge_alpha_mcp_server.mjs # Production MCP Server (JSON-RPC 2.0 stdio)
+├── web/                             # Live Web Operator Console (React + Tailwind)
+│   ├── src/components/oracle/Console.tsx
+│   ├── src/lib/oracle-store.ts
+│   └── package.json
+├── test/
+│   ├── witness_settlement_mvp.mjs   # Round 8 56.2ms DSSE + AES-256-GCM + HTLC benchmark
+│   ├── live_vertical_harness.mjs    # Round 11-12 Multi-vertical stdio verification
+│   ├── tier2_sse_stress_test.mjs    # Round 15 Tier 2 SSE stream stress test (p99: 5.4ms)
+│   ├── tier3_exclusive_race_test.mjs# Round 16 Tier 3 race condition & 50 USDC equivocation slash
+│   ├── pnl_sensitivity_model.mjs    # Round 17 90-day solo-operator P&L sensitivity model
+│   ├── kill_switch_circuit_breaker_test.mjs # Round 18 sub-ms auto-kill-switch
+│   └── rearm_protocol_and_runbook_test.mjs  # Round 19 3-gate Ed25519 re-arm runbook
+├── mcp_registry_manifest.json       # MCP & x402 discovery manifest
+└── package.json                     # v1.2.0 release definition
+```
+
+---
+
+## 8. Web Operator Console
+
+The interactive web console is maintained in [`web/`](./web) and deployed live at [https://oasis-pearl-beam-berry.grok.me/](https://oasis-pearl-beam-berry.grok.me/).
+
+- **Witness Feed**: Real-time DSSE commitments across GPU spot and hardware restocks with 900s countdown timers.
+- **x402 Tiers**: Instant Tier 1 reveal ($0.25), Tier 2 quota stream ($4.50/hr), and Tier 3 atomic burn ($25.00).
+- **Tier 4 Co-Buy**: Syndicate slider threshold settlement (unlocks wholesale payload only upon 100% fill).
+- **Slash Verifier**: Integer-cent predicate test against the Base L2 10 USDC bond.
+- **Governance Rails**: 2-domain allow-list, 200/day limit, 5-agent cap, and 3-gate Ed25519 re-arm controls.
