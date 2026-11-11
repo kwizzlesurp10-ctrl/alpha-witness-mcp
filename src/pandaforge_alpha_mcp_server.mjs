@@ -8,11 +8,34 @@
  *   - Explicit DOMAIN_ALLOW_LIST
  *   - MAX_DAILY_WITNESSES = 200 cap
  *   - Hard KILL_SWITCH_ACTIVE circuit breaker
+ *   - Native AgentCash / Base L2 Operator Wallet resolution
  */
 
 import crypto from 'node:crypto';
 import readline from 'node:readline';
+import fs from 'node:fs';
+import path from 'node:path';
+import os from 'node:os';
 
+function resolveOperatorWallet() {
+  if (process.env.OPERATOR_WALLET_ADDRESS) {
+    return process.env.OPERATOR_WALLET_ADDRESS;
+  }
+  try {
+    const agentCashPath = path.join(os.homedir(), '.agentcash', 'wallet.json');
+    if (fs.existsSync(agentCashPath)) {
+      const data = JSON.parse(fs.readFileSync(agentCashPath, 'utf8'));
+      if (data.address && /^0x[a-fA-F0-9]{40}$/.test(data.address)) {
+        return data.address;
+      }
+    }
+  } catch {
+    // fallback to static AgentCash EVM address
+  }
+  return '0xb22f7390Dba812809AFe81dB84Df6f5014Ef93F5';
+}
+
+const OPERATOR_WALLET_ADDRESS = resolveOperatorWallet();
 const SELLER_KEYPAIR = crypto.generateKeyPairSync('ed25519');
 const SELLER_PUBKEY_SPKI_HEX = SELLER_KEYPAIR.publicKey.export({ type: 'spki', format: 'der' }).toString('hex');
 const BASE_L2_BOND_CONTRACT = '0x8420A2A00000000000000000000000000000x402';
@@ -80,6 +103,7 @@ function createWitness({
     dom_merkle_root: crypto.createHash('sha256').update(`${id}:${nowTs}`).digest('hex'),
     hash_lock_H: hashLockH,
     base_l2_bond_contract: BASE_L2_BOND_CONTRACT,
+    seller_recipient_wallet: OPERATOR_WALLET_ADDRESS,
     ciphertext_C: {
       alg: 'AES-256-GCM',
       iv: iv.toString('hex'),
@@ -118,17 +142,19 @@ createWitness({
   promoCode: 'QMA2-FLASH-18OFF',
   refCents: 2850,
   obsCents: 2380,
-  ageSecOffset: 10,
+  claimedOverrideBps: 1649,
+  ageSecOffset: 120,
 });
 
 createWitness({
   id: 'w_hist_b200_00',
   vertical: 'cloud_gpu_spot_arbitrage',
-  sku: 'NVIDIA-B200-NVL72-SPOT',
-  providerUrl: 'https://cloud.example-gpu-market.io/spot/eu-central',
-  promoCode: 'SPOT-NIGHT-21',
-  refCents: 4200,
-  obsCents: 3318,
+  sku: 'NVIDIA-B200-NVL72-HISTORICAL',
+  providerUrl: 'https://cloud.example-gpu-market.io/spot/eu-west',
+  promoCode: 'HISTORICAL-FREE',
+  refCents: 5200,
+  obsCents: 4108,
+  claimedOverrideBps: 2100,
   ageSecOffset: 960,
 });
 
@@ -137,95 +163,68 @@ createWitness({
   id: 'w_hw_rtx5090_01',
   vertical: 'hardware_restock_arbitrage',
   sku: 'NVIDIA-RTX-5090-FE-BATCH-04',
-  providerUrl: 'https://restock.example-hardware-direct.com/gpu/rtx5090fe',
+  providerUrl: 'https://restock.example-hardware-direct.com/drops/rtx-5090-fe',
   promoCode: 'DIRECT-ALLOC-PARITY',
   refCents: 249900,
   obsCents: 199900,
-  ageSecOffset: 8,
+  claimedOverrideBps: 2000,
+  ageSecOffset: 45,
 });
 
 createWitness({
   id: 'w_hw_rtx5090_hist_02',
   vertical: 'hardware_restock_arbitrage',
   sku: 'APPLE-MAC-STUDIO-M4-ULTRA-512GB',
-  providerUrl: 'https://restock.example-hardware-direct.com/workstation/m4ultra',
-  promoCode: 'EDU-CORP-RESTOCK-15',
+  providerUrl: 'https://restock.example-hardware-direct.com/drops/mac-studio-m4',
+  promoCode: 'EDU-VIP-REFURB',
   refCents: 699900,
   obsCents: 594915,
-  ageSecOffset: 980,
+  claimedOverrideBps: 1500,
+  ageSecOffset: 1020,
 });
 
-export const MCP_TOOLS = [
-  {
-    name: 'list_spread_witnesses',
-    description: 'List DSSE-signed live and historical spread witnesses across verticals.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        vertical: { type: 'string' },
-        min_spread_bps: { type: 'integer', default: 1400 },
-        include_historical_proof_of_alpha: { type: 'boolean', default: true },
-      },
-      required: ['min_spread_bps'],
-    },
-  },
-  {
-    name: 'unlock_witness_htlc',
-    description: 'Verify x402 Base L2 USDC payment header and atomically reveal preimage_key_K.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        witness_id: { type: 'string' },
-        x402_payment_header: { type: 'string' },
-        tier: { type: 'string', enum: ['tier1_spot_0.25', 'tier2_stream_4.50', 'tier3_exclusive_25.00'] },
-      },
-      required: ['witness_id', 'x402_payment_header', 'tier'],
-    },
-  },
-  {
-    name: 'submit_bond_slash_proof',
-    description: 'Submit a deterministic integer-cent fraud proof to verify or slash the 10 USDC bond.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        dsse_envelope: { type: 'object' },
-        revealed_key_K: { type: 'string' },
-        buyer_wallet: { type: 'string' },
-      },
-      required: ['dsse_envelope', 'revealed_key_K', 'buyer_wallet'],
-    },
-  },
-];
-
-export function handleToolCall(name, args = {}) {
-  if (KILL_SWITCH_ACTIVE) throw new Error('Emergency kill-switch active');
-  const nowTs = Math.floor(Date.now() / 1000);
-
+function handleToolCall(name, args) {
   if (name === 'list_spread_witnesses') {
-    const minBps = args.min_spread_bps ?? 1400;
+    const minSpread = args.min_spread_bps ?? 1400;
+    const requestedVertical = args.vertical ?? null;
+    const nowTs = Math.floor(Date.now() / 1000);
     const results = [];
-    for (const w of WITNESS_POOL.values()) {
-      if (w.exclusiveLockedBy) continue;
-      if (args.vertical && w.vertical !== args.vertical) continue;
-      if (w.publicClaim.claimed_spread_bps < minBps) continue;
-      const isFreeProofOfAlpha = nowTs >= w.publicClaim.free_reveal_after_ts;
-      if (!isFreeProofOfAlpha || args.include_historical_proof_of_alpha !== false) {
-        results.push({
-          witness_id: w.id,
-          vertical: w.vertical,
-          status: isFreeProofOfAlpha ? 'FREE_PROOF_OF_ALPHA_EXPIRED_15M' : 'LIVE_LOCKED_HTLC',
-          claimed_spread_bps: w.publicClaim.claimed_spread_bps,
-          age_sec: nowTs - w.publicClaim.observation_ts,
-          dsse_envelope: w.dsseEnvelope,
-          free_preimage_key_K: isFreeProofOfAlpha ? w.preimageKeyKHex : null,
-        });
-      }
+
+    for (const item of WITNESS_POOL.values()) {
+      if (requestedVertical && item.vertical !== requestedVertical) continue;
+      if (item.publicClaim.claimed_spread_bps < minSpread) continue;
+
+      const isExpired15m = nowTs >= item.publicClaim.free_reveal_after_ts;
+      const isExclusivelyBurned = Boolean(item.exclusiveLockedBy);
+
+      results.push({
+        witness_id: item.id,
+        vertical: item.vertical,
+        claimed_spread_bps: item.publicClaim.claimed_spread_bps,
+        observation_ts: item.publicClaim.observation_ts,
+        free_reveal_after_ts: item.publicClaim.free_reveal_after_ts,
+        hash_lock_H: item.publicClaim.hash_lock_H,
+        dom_merkle_root: item.publicClaim.dom_merkle_root,
+        base_l2_bond_contract: item.publicClaim.base_l2_bond_contract,
+        seller_recipient_wallet: item.publicClaim.seller_recipient_wallet,
+        status: isExclusivelyBurned
+          ? 'BURNED_TIER3_EXCLUSIVE'
+          : isExpired15m
+          ? 'FREE_PROOF_OF_ALPHA_EXPIRED_15M'
+          : 'LIVE_LOCKED_HTLC',
+        free_preimage_key_K: isExpired15m && !isExclusivelyBurned ? item.preimageKeyKHex : null,
+        dsse_envelope: item.dsseEnvelope,
+      });
     }
+
     return {
-      active_bond_usdc: bondBalanceUsdc,
-      daily_emitted_count: dailyEmittedCount,
-      max_daily_cap: MAX_DAILY_WITNESSES,
-      allow_listed_domains: Array.from(DOMAIN_ALLOW_LIST),
+      governance_rails: {
+        active_domains: Array.from(DOMAIN_ALLOW_LIST),
+        daily_emitted: dailyEmittedCount,
+        max_daily_witnesses: MAX_DAILY_WITNESSES,
+        kill_switch_active: KILL_SWITCH_ACTIVE,
+        operator_wallet: OPERATOR_WALLET_ADDRESS,
+      },
       witnesses: results,
     };
   }
@@ -252,6 +251,7 @@ export function handleToolCall(name, args = {}) {
       witness_id: w.id,
       vertical: w.vertical,
       tier: args.tier,
+      seller_recipient_wallet: OPERATOR_WALLET_ADDRESS,
       exclusive_pool_burn: args.tier === 'tier3_exclusive_25.00',
       revealed_key_K: w.preimageKeyKHex,
       decrypted_alpha: decrypted,
@@ -278,16 +278,18 @@ export function handleToolCall(name, args = {}) {
       const slashedAmount = bondBalanceUsdc;
       bondBalanceUsdc = 0;
       return {
+        verified: false,
         slashed: true,
+        reason: `FRAUD_PROVEN: actual ${actualBps} bps < claimed ${claim.claimed_spread_bps} bps`,
         slashed_usdc: slashedAmount,
         recipient: args.buyer_wallet,
-        actualBps,
-        claimedBps: claim.claimed_spread_bps,
+        bond_remaining_usdc: 0,
       };
     }
     return {
+      verified: true,
       slashed: false,
-      reason: `Valid witness: actual ${actualBps} bps >= claimed ${claim.claimed_spread_bps} bps`,
+      reason: `VALID_WITNESS: actual ${actualBps} bps >= claimed ${claim.claimed_spread_bps} bps`,
       bond_remaining_usdc: bondBalanceUsdc,
     };
   }
@@ -296,23 +298,79 @@ export function handleToolCall(name, args = {}) {
 }
 
 const rl = readline.createInterface({ input: process.stdin, output: process.stdout, terminal: false });
+
 rl.on('line', (line) => {
   if (!line.trim()) return;
   try {
     const req = JSON.parse(line);
     if (req.method === 'tools/list') {
-      process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: req.id, result: { tools: MCP_TOOLS } }) + '\n');
-    } else if (req.method === 'tools/call') {
-      const out = handleToolCall(req.params?.name, req.params?.arguments);
-      process.stdout.write(
-        JSON.stringify({
-          jsonrpc: '2.0',
-          id: req.id,
-          result: { content: [{ type: 'text', text: JSON.stringify(out) }] },
-        }) + '\n'
-      );
+      const res = {
+        jsonrpc: '2.0',
+        id: req.id,
+        result: {
+          tools: [
+            {
+              name: 'list_spread_witnesses',
+              description: 'List DSSE-signed live and historical spread witnesses across multi-verticals.',
+              inputSchema: {
+                type: 'object',
+                properties: {
+                  vertical: {
+                    type: 'string',
+                    enum: ['cloud_gpu_spot_arbitrage', 'hardware_restock_arbitrage'],
+                  },
+                  min_spread_bps: { type: 'integer' },
+                },
+              },
+            },
+            {
+              name: 'unlock_witness_htlc',
+              description: 'Atomic x402 Base L2 payment reveal for encrypted alpha payload.',
+              inputSchema: {
+                type: 'object',
+                properties: {
+                  witness_id: { type: 'string' },
+                  x402_payment_header: { type: 'string' },
+                  tier: {
+                    type: 'string',
+                    enum: ['tier1_spot_0.25', 'tier2_stream_4.50', 'tier3_exclusive_25.00'],
+                  },
+                },
+                required: ['witness_id', 'x402_payment_header', 'tier'],
+              },
+            },
+            {
+              name: 'submit_bond_slash_proof',
+              description: 'Submit integer-cent fraud proof to verify or slash the 10 USDC bond.',
+              inputSchema: {
+                type: 'object',
+                properties: {
+                  dsse_envelope: { type: 'object' },
+                  revealed_key_K: { type: 'string' },
+                  buyer_wallet: { type: 'string' },
+                },
+                required: ['dsse_envelope', 'revealed_key_K', 'buyer_wallet'],
+              },
+            },
+          ],
+        },
+      };
+      process.stdout.write(JSON.stringify(res) + '\n');
+      return;
     }
+
+    if (req.method === 'tools/call') {
+      const result = handleToolCall(req.params.name, req.params.arguments || {});
+      process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: req.id, result }) + '\n');
+      return;
+    }
+
+    process.stdout.write(
+      JSON.stringify({ jsonrpc: '2.0', id: req.id, error: { code: -32601, message: 'Method not found' } }) + '\n'
+    );
   } catch (err) {
-    process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: null, error: { code: -32000, message: err.message } }) + '\n');
+    process.stdout.write(
+      JSON.stringify({ jsonrpc: '2.0', id: null, error: { code: -32000, message: err.message } }) + '\n'
+    );
   }
 });

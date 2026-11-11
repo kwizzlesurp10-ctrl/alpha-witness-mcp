@@ -3,7 +3,7 @@
 > **QMA² Coordi-HierSupe Panda Production Launch Authorized (`Final Aggregate Heat: 5%`)**
 > Co-designed and verified across **20 autonomous rounds** between **Antigravity CLI** and **Grok (`Model: Expert`)** via the **PandaForge MV3 Browser Bridge (`127.0.0.1:8787`)** and **SwarmScribe QMA² v2.1 (`Central Coordinator × Hierarchical Supervisor`)**.
 
-> 🌐 **Live Web Operator Console**: [https://oasis-pearl-berry.grok.me/](https://oasis-pearl-beam-berry.grok.me/)  
+> 🌐 **Live Web Operator Console**: [https://oasis-pearl-beam-berry.grok.me/](https://oasis-pearl-beam-berry.grok.me/)  
 > Dark-phosphor reactive dashboard built with Grok Build and deployed live. Real-time DSSE commitments, 900s free Proof-of-Alpha countdowns, x402 Tier 1-3 reveals, Tier 4 syndicate threshold co-buy, 10 USDC slash verifier, and manual 3-gate circuit breaker controls.
 
 ---
@@ -34,6 +34,12 @@ npx -y @pandaforge/alpha-witness-mcp
 # Run full 7-suite verification & stress tests:
 npm test
 ```
+
+### Operator Wallet Configuration (AgentCash Native)
+The server automatically resolves the seller/operator recipient address for all incoming `x402` Base L2 micro-settlements (Tier 1–3) and bond payouts in this order:
+1. `process.env.OPERATOR_WALLET_ADDRESS` (custom override)
+2. Native **AgentCash** wallet: `~/.agentcash/wallet.json` (`address: 0xb22f7390Dba812809AFe81dB84Df6f5014Ef93F5`)
+3. Static fallback: `0xb22f7390Dba812809AFe81dB84Df6f5014Ef93F5`
 
 ### 5-Line External Buyer Agent Usage
 ```javascript

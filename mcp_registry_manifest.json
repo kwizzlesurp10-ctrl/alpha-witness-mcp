@@ -11,6 +11,11 @@
     "rolling_slash_bond_usdc": "10.00",
     "free_proof_of_alpha_delay_sec": 900,
     "kill_switch_default": false,
+    "operator_wallet": {
+      "default_resolution": "process.env.OPERATOR_WALLET_ADDRESS || ~/.agentcash/wallet.json",
+      "configured_address": "0xb22f7390Dba812809AFe81dB84Df6f5014Ef93F5",
+      "network": "Base L2 (Chain ID: 8453)"
+    },
     "allow_listed_domains": [
       "cloud.example-gpu-market.io",
       "restock.example-hardware-direct.com"
