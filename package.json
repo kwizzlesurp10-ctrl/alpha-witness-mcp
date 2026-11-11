@@ -1,0 +1,33 @@
+{
+  "name": "@pandaforge/alpha-witness-mcp",
+  "version": "1.2.0",
+  "description": "Zero-CAC Verifiable Spread Witness & Live Intent Arbitrage MCP Server (GPU Spot + Hardware Restocks) with Ed25519 DSSE commitments, 15-minute Delayed Public Proof-of-Alpha, and Base L2 x402 HTLC + 10 USDC Optimistic Slashed Bond protection.",
+  "type": "module",
+  "bin": {
+    "alpha-witness-mcp": "./src/pandaforge_alpha_mcp_server.mjs"
+  },
+  "main": "./src/pandaforge_alpha_mcp_server.mjs",
+  "scripts": {
+    "start": "node ./src/pandaforge_alpha_mcp_server.mjs",
+    "test:mvp": "node ./test/witness_settlement_mvp.mjs",
+    "test:verticals": "node ./test/live_vertical_harness.mjs",
+    "test:tier2-sse": "node ./test/tier2_sse_stress_test.mjs",
+    "test:tier3-race": "node ./test/tier3_exclusive_race_test.mjs",
+    "test:pnl": "node ./test/pnl_sensitivity_model.mjs",
+    "test:kill-switch": "node ./test/kill_switch_circuit_breaker_test.mjs",
+    "test:runbook": "node ./test/rearm_protocol_and_runbook_test.mjs",
+    "test": "npm run test:mvp && npm run test:verticals && npm run test:tier2-sse && npm run test:tier3-race && npm run test:pnl && npm run test:kill-switch && npm run test:runbook"
+  },
+  "keywords": [
+    "mcp",
+    "pandaforge",
+    "swarmscribe",
+    "qma2",
+    "x402",
+    "dsse",
+    "htlc",
+    "arbitrage",
+    "base-l2"
+  ],
+  "license": "MIT"
+}

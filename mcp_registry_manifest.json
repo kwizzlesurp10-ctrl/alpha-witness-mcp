@@ -1,0 +1,66 @@
+{
+  "name": "@pandaforge/alpha-witness-mcp",
+  "version": "1.2.0",
+  "description": "Zero-CAC Verifiable Spread Witness & Live Intent Arbitrage MCP Server (GPU Spot + Hardware Restocks) with Ed25519 DSSE commitments, 15-minute Delayed Public Proof-of-Alpha, and Base L2 x402 HTLC + 10 USDC Optimistic Slashed Bond protection.",
+  "install": "npx -y @pandaforge/alpha-witness-mcp",
+  "transport": ["stdio", "sse"],
+  "governanceRailsDays1To7": {
+    "max_daily_witnesses": 200,
+    "max_external_buyer_agents": 5,
+    "tier1_price_usdc": "0.25",
+    "rolling_slash_bond_usdc": "10.00",
+    "free_proof_of_alpha_delay_sec": 900,
+    "kill_switch_default": false,
+    "allow_listed_domains": [
+      "cloud.example-gpu-market.io",
+      "restock.example-hardware-direct.com"
+    ]
+  },
+  "tools": [
+    {
+      "name": "list_spread_witnesses",
+      "description": "List DSSE-signed live and historical spread witnesses across cloud_gpu_spot_arbitrage and hardware_restock_arbitrage. Automatically exposes free_preimage_key_K after 900s.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "vertical": {
+            "type": "string",
+            "enum": ["cloud_gpu_spot_arbitrage", "hardware_restock_arbitrage"]
+          },
+          "min_spread_bps": { "type": "integer", "default": 1400 },
+          "include_historical_proof_of_alpha": { "type": "boolean", "default": true }
+        },
+        "required": ["min_spread_bps"]
+      }
+    },
+    {
+      "name": "unlock_witness_htlc",
+      "description": "Verify x402 Base L2 USDC payment header locked to hash_lock_H and atomically reveal preimage_key_K + decrypted SKU/URL/promo payload.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "witness_id": { "type": "string" },
+          "x402_payment_header": { "type": "string" },
+          "tier": {
+            "type": "string",
+            "enum": ["tier1_spot_0.25", "tier2_stream_4.50", "tier3_exclusive_25.00"]
+          }
+        },
+        "required": ["witness_id", "x402_payment_header", "tier"]
+      }
+    },
+    {
+      "name": "submit_bond_slash_proof",
+      "description": "Submit a deterministic integer-cent fraud proof (DSSE envelope + revealed_key_K) to verify or slash the 10 USDC bond if actual_bps < claimed_spread_bps.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "dsse_envelope": { "type": "object" },
+          "revealed_key_K": { "type": "string" },
+          "buyer_wallet": { "type": "string" }
+        },
+        "required": ["dsse_envelope", "revealed_key_K", "buyer_wallet"]
+      }
+    }
+  ]
+}
