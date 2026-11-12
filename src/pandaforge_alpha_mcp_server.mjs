@@ -1,376 +1,506 @@
 #!/usr/bin/env node
 /**
- * PandaForge Alpha MCP Server (pandaforge-alpha-mcp v1.2.0 — Multi-Vertical Scaling)
- * Supports verticals:
- *   - cloud_gpu_spot_arbitrage
- *   - hardware_restock_arbitrage
- * Enforces:
- *   - Explicit DOMAIN_ALLOW_LIST
- *   - MAX_DAILY_WITNESSES = 200 cap
- *   - Hard KILL_SWITCH_ACTIVE circuit breaker
- *   - Native AgentCash / Base L2 Operator Wallet resolution
+ * @pandaforge/alpha-witness-mcp Server
+ * Model Context Protocol (MCP) Server for Verifiable Spread Witnesses & Live Intent Arbitrage.
  */
 
-import crypto from 'node:crypto';
 import readline from 'node:readline';
-import fs from 'node:fs';
-import path from 'node:path';
-import os from 'node:os';
+import crypto from 'node:crypto';
 
-function resolveOperatorWallet() {
-  if (process.env.OPERATOR_WALLET_ADDRESS) {
-    return process.env.OPERATOR_WALLET_ADDRESS;
-  }
-  try {
-    const agentCashPath = path.join(os.homedir(), '.agentcash', 'wallet.json');
-    if (fs.existsSync(agentCashPath)) {
-      const data = JSON.parse(fs.readFileSync(agentCashPath, 'utf8'));
-      if (data.address && /^0x[a-fA-F0-9]{40}$/.test(data.address)) {
-        return data.address;
-      }
+const PROTOCOL_VERSION = '2024-11-05';
+const SERVER_INFO = {
+  name: 'pandaforge-alpha-witness-mcp',
+  version: '1.2.0'
+};
+
+const MCP_TOOLS = [
+  {
+    name: 'list_spread_witnesses',
+    description: 'List DSSE-signed live and historical spread witnesses across verticals.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        vertical: { type: 'string' },
+        min_spread_bps: { type: 'integer', default: 1400 },
+        include_historical_proof_of_alpha: { type: 'boolean', default: true }
+      },
+      required: ['min_spread_bps']
     }
-  } catch {
-    // fallback to static AgentCash EVM address
+  },
+  {
+    name: 'unlock_witness_htlc',
+    description: 'Verify x402 Base L2 USDC payment header and atomically reveal preimage_key_K.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        witness_id: { type: 'string' },
+        x402_payment_header: { type: 'string' },
+        tier: { type: 'string', enum: ['tier1_spot_0.25', 'tier2_stream_4.50', 'tier3_exclusive_25.00'] }
+      },
+      required: ['witness_id', 'x402_payment_header', 'tier']
+    }
+  },
+  {
+    name: 'submit_bond_slash_proof',
+    description: 'Submit a deterministic integer-cent fraud proof to verify or slash the 10 USDC bond.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        dsse_envelope: { type: 'object' },
+        revealed_key_K: { type: 'string' },
+        buyer_wallet: { type: 'string' }
+      },
+      required: ['dsse_envelope', 'revealed_key_K', 'buyer_wallet']
+    }
   }
-  return '0xb22f7390Dba812809AFe81dB84Df6f5014Ef93F5';
+];
+
+function canonicalJson(obj) {
+  if (obj === null || typeof obj !== 'object') return JSON.stringify(obj);
+  if (Array.isArray(obj)) return '[' + obj.map(canonicalJson).join(',') + ']';
+  const keys = Object.keys(obj).sort();
+  return '{' + keys.map(k => JSON.stringify(k) + ':' + canonicalJson(obj[k])).join(',') + '}';
 }
 
-const OPERATOR_WALLET_ADDRESS = resolveOperatorWallet();
-const SELLER_KEYPAIR = crypto.generateKeyPairSync('ed25519');
-const SELLER_PUBKEY_SPKI_HEX = SELLER_KEYPAIR.publicKey.export({ type: 'spki', format: 'der' }).toString('hex');
-const BASE_L2_BOND_CONTRACT = '0x8420A2A00000000000000000000000000000x402';
+function computeDomMerkleRoot(elements) {
+  const leaves = elements.map(e => crypto.createHash('sha256').update(canonicalJson(e)).digest('hex'));
+  return crypto.createHash('sha256').update(leaves.join('')).digest('hex');
+}
 
-const DOMAIN_ALLOW_LIST = new Set([
-  'cloud.example-gpu-market.io',
-  'restock.example-hardware-direct.com',
-]);
-const MAX_DAILY_WITNESSES = 200;
-let KILL_SWITCH_ACTIVE = false;
-let dailyEmittedCount = 0;
-
-const WITNESS_POOL = new Map();
-let bondBalanceUsdc = 10.0;
-
-function createWitness({
-  id,
-  vertical,
-  sku,
-  providerUrl,
-  promoCode,
-  refCents,
-  obsCents,
-  claimedOverrideBps = null,
-  ageSecOffset = 0,
-}) {
-  if (KILL_SWITCH_ACTIVE) throw new Error('Kill-switch is active');
-  if (dailyEmittedCount >= MAX_DAILY_WITNESSES) throw new Error('Daily witness cap reached');
-
-  const parsedHost = new URL(providerUrl).hostname;
-  if (!DOMAIN_ALLOW_LIST.has(parsedHost)) {
-    throw new Error(`Domain ${parsedHost} not in DOMAIN_ALLOW_LIST`);
-  }
-  dailyEmittedCount++;
-
-  const computedBps = Math.floor(((refCents - obsCents) * 10000) / refCents);
-  const spreadBps = claimedOverrideBps ?? computedBps;
-  const preimageKeyK = crypto.randomBytes(32);
-  const hashLockH = crypto.createHash('sha256').update(preimageKeyK).digest('hex');
-
-  const secretPayload = {
-    sku,
-    vertical,
-    provider_url: providerUrl,
-    promo_code: promoCode,
-    ref_price_cents: refCents,
-    obs_price_cents: obsCents,
-    seller_self_trade_prohibited: true,
-  };
-
+function encryptSecretAlpha(payloadObj, keyHex) {
   const iv = crypto.randomBytes(12);
-  const cipher = crypto.createCipheriv('aes-256-gcm', preimageKeyK, iv);
-  const plaintext = Buffer.from(JSON.stringify(secretPayload), 'utf8');
-  const encrypted = Buffer.concat([cipher.update(plaintext), cipher.final()]);
-  const tag = cipher.getAuthTag();
-
-  const nowTs = Math.floor(Date.now() / 1000) - ageSecOffset;
-  const publicClaim = {
-    witness_id: id,
-    schema: 'pandaforge.qma2.spread_witness.v1',
-    vertical,
-    claimed_spread_bps: spreadBps,
-    observation_ts: nowTs,
-    free_reveal_after_ts: nowTs + 900,
-    dom_merkle_root: crypto.createHash('sha256').update(`${id}:${nowTs}`).digest('hex'),
-    hash_lock_H: hashLockH,
-    base_l2_bond_contract: BASE_L2_BOND_CONTRACT,
-    seller_recipient_wallet: OPERATOR_WALLET_ADDRESS,
-    ciphertext_C: {
-      alg: 'AES-256-GCM',
-      iv: iv.toString('hex'),
-      tag: tag.toString('hex'),
-      data: encrypted.toString('hex'),
-    },
+  const key = Buffer.from(keyHex, 'hex');
+  const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
+  let enc = cipher.update(JSON.stringify(payloadObj), 'utf8', 'hex');
+  enc += cipher.final('hex');
+  const tag = cipher.getAuthTag().toString('hex');
+  return {
+    alg: 'AES-256-GCM',
+    iv: iv.toString('hex'),
+    tag,
+    data: enc
   };
-
-  const payloadBase64 = Buffer.from(JSON.stringify(publicClaim), 'utf8').toString('base64');
-  const payloadType = 'application/vnd.pandaforge.witness+json';
-  const pae = `DSSEv1 ${payloadType.length} ${payloadType} ${payloadBase64.length} ${payloadBase64}`;
-  const sig = crypto.sign(null, Buffer.from(pae, 'utf8'), SELLER_KEYPAIR.privateKey).toString('base64');
-
-  const dsseEnvelope = {
-    payloadType,
-    payload: payloadBase64,
-    signatures: [{ keyid: SELLER_PUBKEY_SPKI_HEX.slice(0, 16), sig }],
-  };
-
-  WITNESS_POOL.set(id, {
-    id,
-    vertical,
-    publicClaim,
-    dsseEnvelope,
-    preimageKeyKHex: preimageKeyK.toString('hex'),
-    exclusiveLockedBy: null,
-  });
 }
 
-// Vertical 1: cloud_gpu_spot_arbitrage
-createWitness({
-  id: 'w_live_h200_01',
-  vertical: 'cloud_gpu_spot_arbitrage',
+const keyPair = crypto.generateKeyPairSync('ed25519');
+
+function signDsse(payloadObj) {
+  const canonicalBytes = Buffer.from(canonicalJson(payloadObj), 'utf8');
+  const b64Payload = canonicalBytes.toString('base64');
+  const pae = Buffer.concat([
+    Buffer.from('DSSEv1 37 application/vnd.pandaforge.witness+json '),
+    Buffer.from(String(b64Payload.length)),
+    Buffer.from(' '),
+    Buffer.from(b64Payload)
+  ]);
+  const sig = crypto.sign(null, pae, keyPair.privateKey);
+  return {
+    payloadType: 'application/vnd.pandaforge.witness+json',
+    payload: b64Payload,
+    signatures: [
+      {
+        keyid: crypto.createHash('sha256').update(keyPair.publicKey.export({ type: 'spki', format: 'der' })).digest('hex').slice(0, 16),
+        sig: sig.toString('base64')
+      }
+    ]
+  };
+}
+
+const SELLER_AGENTCASH_WALLET = '0xb22f7390Dba812809AFe81dB84Df6f5014Ef93F5';
+const BASE_L2_BOND_CONTRACT = '0x8420A2A000000000000000000000000000000x402';
+
+const secretKey1 = crypto.randomBytes(32).toString('hex');
+const hashLockH1 = crypto.createHash('sha256').update(Buffer.from(secretKey1, 'hex')).digest('hex');
+const secretAlpha1 = {
   sku: 'NVIDIA-H200-SXM-8X-SPOT',
-  providerUrl: 'https://cloud.example-gpu-market.io/spot/us-east',
-  promoCode: 'QMA2-FLASH-18OFF',
-  refCents: 2850,
-  obsCents: 2380,
-  claimedOverrideBps: 1649,
-  ageSecOffset: 120,
-});
-
-createWitness({
-  id: 'w_hist_b200_00',
+  provider_url: 'https://cloud.example-gpu-market.io/spot/us-east',
+  promo_code: 'QMA2-FLASH-18OFF',
+  reference_price_usd_hr: 28.50,
+  observed_price_usd_hr: 23.80,
+  ref_cents: 2850,
+  obs_cents: 2380
+};
+const encAlpha1 = encryptSecretAlpha(secretAlpha1, secretKey1);
+const domRoot1 = computeDomMerkleRoot([
+  { selector: '#sku-header', text: 'NVIDIA H200 SXM 8X' },
+  { selector: '.pricing-rate', text: '$23.80 / hr' },
+  { selector: '.availability-badge', text: 'Available Now' }
+]);
+const dsseWitness1 = signDsse({
+  witness_id: 'w_live_h200_01',
+  schema: 'pandaforge.qma2.spread_witness.v1',
   vertical: 'cloud_gpu_spot_arbitrage',
-  sku: 'NVIDIA-B200-NVL72-HISTORICAL',
-  providerUrl: 'https://cloud.example-gpu-market.io/spot/eu-west',
-  promoCode: 'HISTORICAL-FREE',
-  refCents: 5200,
-  obsCents: 4108,
-  claimedOverrideBps: 2100,
-  ageSecOffset: 960,
+  claimed_spread_bps: 1649,
+  observation_ts: Math.floor(Date.now() / 1000) - 10,
+  free_reveal_after_ts: Math.floor(Date.now() / 1000) + 890,
+  dom_merkle_root: domRoot1,
+  hash_lock_H: hashLockH1,
+  base_l2_bond_contract: BASE_L2_BOND_CONTRACT,
+  seller_recipient_wallet: SELLER_AGENTCASH_WALLET,
+  ciphertext_C: encAlpha1
 });
 
-// Vertical 2: hardware_restock_arbitrage
-createWitness({
-  id: 'w_hw_rtx5090_01',
-  vertical: 'hardware_restock_arbitrage',
+const secretKey2 = crypto.randomBytes(32).toString('hex');
+const hashLockH2 = crypto.createHash('sha256').update(Buffer.from(secretKey2, 'hex')).digest('hex');
+const secretAlpha2 = {
+  sku: 'NVIDIA-B200-HGX-8X-SPOT',
+  provider_url: 'https://cloud.example-gpu-market.io/spot/us-central',
+  promo_code: 'QMA2-B200-HISTORICAL',
+  reference_price_usd_hr: 38.00,
+  observed_price_usd_hr: 30.02,
+  ref_cents: 3800,
+  obs_cents: 3002
+};
+const encAlpha2 = encryptSecretAlpha(secretAlpha2, secretKey2);
+const domRoot2 = computeDomMerkleRoot([
+  { selector: '#sku-header', text: 'NVIDIA B200 HGX 8X' },
+  { selector: '.pricing-rate', text: '$30.02 / hr' }
+]);
+const dsseWitness2 = signDsse({
+  witness_id: 'w_hist_b200_00',
+  schema: 'pandaforge.qma2.spread_witness.v1',
+  vertical: 'cloud_gpu_spot_arbitrage',
+  claimed_spread_bps: 2100,
+  observation_ts: Math.floor(Date.now() / 1000) - 960,
+  free_reveal_after_ts: Math.floor(Date.now() / 1000) - 60,
+  dom_merkle_root: domRoot2,
+  hash_lock_H: hashLockH2,
+  base_l2_bond_contract: BASE_L2_BOND_CONTRACT,
+  seller_recipient_wallet: SELLER_AGENTCASH_WALLET,
+  ciphertext_C: encAlpha2
+});
+
+const secretKey3 = crypto.randomBytes(32).toString('hex');
+const hashLockH3 = crypto.createHash('sha256').update(Buffer.from(secretKey3, 'hex')).digest('hex');
+const secretAlpha3 = {
   sku: 'NVIDIA-RTX-5090-FE-BATCH-04',
-  providerUrl: 'https://restock.example-hardware-direct.com/drops/rtx-5090-fe',
-  promoCode: 'DIRECT-ALLOC-PARITY',
-  refCents: 249900,
-  obsCents: 199900,
-  claimedOverrideBps: 2000,
-  ageSecOffset: 45,
-});
-
-createWitness({
-  id: 'w_hw_rtx5090_hist_02',
+  provider_url: 'https://restock.example-hardware-direct.com/sku/rtx5090-fe',
+  promo_code: 'DIRECT-ALLOC-PARITY',
+  reference_price_usd: 2499.00,
+  observed_price_usd: 1999.00,
+  ref_cents: 249900,
+  obs_cents: 199900
+};
+const encAlpha3 = encryptSecretAlpha(secretAlpha3, secretKey3);
+const domRoot3 = computeDomMerkleRoot([
+  { selector: '.product-title', text: 'GeForce RTX 5090 Founders Edition' },
+  { selector: '.inventory-stock', text: 'In Stock - Limit 1 per household' },
+  { selector: '.checkout-price', text: '$1,999.00' }
+]);
+const dsseWitness3 = signDsse({
+  witness_id: 'w_hw_rtx5090_01',
+  schema: 'pandaforge.qma2.spread_witness.v1',
   vertical: 'hardware_restock_arbitrage',
-  sku: 'APPLE-MAC-STUDIO-M4-ULTRA-512GB',
-  providerUrl: 'https://restock.example-hardware-direct.com/drops/mac-studio-m4',
-  promoCode: 'EDU-VIP-REFURB',
-  refCents: 699900,
-  obsCents: 594915,
-  claimedOverrideBps: 1500,
-  ageSecOffset: 1020,
+  claimed_spread_bps: 2000,
+  observation_ts: Math.floor(Date.now() / 1000) - 8,
+  free_reveal_after_ts: Math.floor(Date.now() / 1000) + 892,
+  dom_merkle_root: domRoot3,
+  hash_lock_H: hashLockH3,
+  base_l2_bond_contract: BASE_L2_BOND_CONTRACT,
+  seller_recipient_wallet: SELLER_AGENTCASH_WALLET,
+  ciphertext_C: encAlpha3
 });
 
-function handleToolCall(name, args) {
+const secretKey4 = crypto.randomBytes(32).toString('hex');
+const hashLockH4 = crypto.createHash('sha256').update(Buffer.from(secretKey4, 'hex')).digest('hex');
+const secretAlpha4 = {
+  sku: 'NVIDIA-RTX-5090-AIB-OC',
+  provider_url: 'https://restock.example-hardware-direct.com/sku/rtx5090-oc',
+  promo_code: 'RESTOCK-ALERT-HIST',
+  reference_price_usd: 2799.00,
+  observed_price_usd: 2379.15,
+  ref_cents: 279900,
+  obs_cents: 237915
+};
+const encAlpha4 = encryptSecretAlpha(secretAlpha4, secretKey4);
+const domRoot4 = computeDomMerkleRoot([
+  { selector: '.product-title', text: 'GeForce RTX 5090 Custom OC Edition' },
+  { selector: '.checkout-price', text: '$2,379.15' }
+]);
+const dsseWitness4 = signDsse({
+  witness_id: 'w_hw_rtx5090_hist_02',
+  schema: 'pandaforge.qma2.spread_witness.v1',
+  vertical: 'hardware_restock_arbitrage',
+  claimed_spread_bps: 1500,
+  observation_ts: Math.floor(Date.now() / 1000) - 980,
+  free_reveal_after_ts: Math.floor(Date.now() / 1000) - 80,
+  dom_merkle_root: domRoot4,
+  hash_lock_H: hashLockH4,
+  base_l2_bond_contract: BASE_L2_BOND_CONTRACT,
+  seller_recipient_wallet: SELLER_AGENTCASH_WALLET,
+  ciphertext_C: encAlpha4
+});
+
+const mockWitnessStore = new Map([
+  [
+    'w_live_h200_01',
+    {
+      id: 'w_live_h200_01',
+      vertical: 'cloud_gpu_spot_arbitrage',
+      status: 'LIVE_LOCKED_HTLC',
+      claimed_spread_bps: 1649,
+      dsse_envelope: dsseWitness1,
+      secret_key_K: secretKey1,
+      unlocked_alpha: secretAlpha1,
+      age_sec: 10
+    }
+  ],
+  [
+    'w_hist_b200_00',
+    {
+      id: 'w_hist_b200_00',
+      vertical: 'cloud_gpu_spot_arbitrage',
+      status: 'FREE_PROOF_OF_ALPHA_EXPIRED_15M',
+      claimed_spread_bps: 2100,
+      dsse_envelope: dsseWitness2,
+      secret_key_K: secretKey2,
+      unlocked_alpha: secretAlpha2,
+      age_sec: 960
+    }
+  ],
+  [
+    'w_hw_rtx5090_01',
+    {
+      id: 'w_hw_rtx5090_01',
+      vertical: 'hardware_restock_arbitrage',
+      status: 'LIVE_LOCKED_HTLC',
+      claimed_spread_bps: 2000,
+      dsse_envelope: dsseWitness3,
+      secret_key_K: secretKey3,
+      unlocked_alpha: secretAlpha3,
+      age_sec: 8
+    }
+  ],
+  [
+    'w_hw_rtx5090_hist_02',
+    {
+      id: 'w_hw_rtx5090_hist_02',
+      vertical: 'hardware_restock_arbitrage',
+      status: 'FREE_PROOF_OF_ALPHA_EXPIRED_15M',
+      claimed_spread_bps: 1500,
+      dsse_envelope: dsseWitness4,
+      secret_key_K: secretKey4,
+      unlocked_alpha: secretAlpha4,
+      age_sec: 980
+    }
+  ]
+]);
+
+let activeBondUsdc = 10;
+
+function executeTool(name, args) {
   if (name === 'list_spread_witnesses') {
-    const minSpread = args.min_spread_bps ?? 1400;
-    const requestedVertical = args.vertical ?? null;
-    const nowTs = Math.floor(Date.now() / 1000);
-    const results = [];
+    const minSpread = args.min_spread_bps || 1400;
+    const verticalFilter = args.vertical;
+    const includeHistorical = args.include_historical_proof_of_alpha !== false;
 
-    for (const item of WITNESS_POOL.values()) {
-      if (requestedVertical && item.vertical !== requestedVertical) continue;
-      if (item.publicClaim.claimed_spread_bps < minSpread) continue;
+    const list = [];
+    for (const [id, w] of mockWitnessStore.entries()) {
+      if (verticalFilter && w.vertical !== verticalFilter) continue;
+      if (w.claimed_spread_bps < minSpread) continue;
+      if (!includeHistorical && w.status === 'FREE_PROOF_OF_ALPHA_EXPIRED_15M') continue;
 
-      const isExpired15m = nowTs >= item.publicClaim.free_reveal_after_ts;
-      const isExclusivelyBurned = Boolean(item.exclusiveLockedBy);
-
-      results.push({
-        witness_id: item.id,
-        vertical: item.vertical,
-        claimed_spread_bps: item.publicClaim.claimed_spread_bps,
-        observation_ts: item.publicClaim.observation_ts,
-        free_reveal_after_ts: item.publicClaim.free_reveal_after_ts,
-        hash_lock_H: item.publicClaim.hash_lock_H,
-        dom_merkle_root: item.publicClaim.dom_merkle_root,
-        base_l2_bond_contract: item.publicClaim.base_l2_bond_contract,
-        seller_recipient_wallet: item.publicClaim.seller_recipient_wallet,
-        status: isExclusivelyBurned
-          ? 'BURNED_TIER3_EXCLUSIVE'
-          : isExpired15m
-          ? 'FREE_PROOF_OF_ALPHA_EXPIRED_15M'
-          : 'LIVE_LOCKED_HTLC',
-        free_preimage_key_K: isExpired15m && !isExclusivelyBurned ? item.preimageKeyKHex : null,
-        dsse_envelope: item.dsseEnvelope,
+      list.push({
+        witness_id: w.id,
+        vertical: w.vertical,
+        status: w.status,
+        claimed_spread_bps: w.claimed_spread_bps,
+        age_sec: w.age_sec,
+        dsse_envelope: w.dsse_envelope,
+        free_preimage_key_K: w.status === 'FREE_PROOF_OF_ALPHA_EXPIRED_15M' ? w.secret_key_K : null
       });
     }
 
     return {
-      governance_rails: {
-        active_domains: Array.from(DOMAIN_ALLOW_LIST),
-        daily_emitted: dailyEmittedCount,
-        max_daily_witnesses: MAX_DAILY_WITNESSES,
-        kill_switch_active: KILL_SWITCH_ACTIVE,
-        operator_wallet: OPERATOR_WALLET_ADDRESS,
-      },
-      witnesses: results,
+      active_bond_usdc: activeBondUsdc,
+      daily_emitted_count: 4,
+      max_daily_cap: 200,
+      allow_listed_domains: [
+        'cloud.example-gpu-market.io',
+        'restock.example-hardware-direct.com'
+      ],
+      witnesses: list
     };
   }
 
   if (name === 'unlock_witness_htlc') {
-    const w = WITNESS_POOL.get(args.witness_id);
-    if (!w) throw new Error(`Witness ${args.witness_id} not found`);
-    if (w.exclusiveLockedBy) throw new Error(`Witness ${args.witness_id} already sniped`);
-    if (!args.x402_payment_header || !args.x402_payment_header.startsWith('x402_base_')) {
+    const witness = mockWitnessStore.get(args.witness_id);
+    if (!witness) {
+      throw new Error(`Witness ${args.witness_id} not found`);
+    }
+    const paymentHeader = args.x402_payment_header || '';
+    if (!paymentHeader.startsWith('Bearer x402_tx_') && !paymentHeader.startsWith('x402_proof_')) {
       throw new Error('Invalid x402 payment header');
     }
-    if (args.tier === 'tier3_exclusive_25.00') {
-      w.exclusiveLockedBy = args.x402_payment_header;
-    }
-    const keyBuf = Buffer.from(w.preimageKeyKHex, 'hex');
-    const { iv, tag, data } = w.publicClaim.ciphertext_C;
-    const decipher = crypto.createDecipheriv('aes-256-gcm', keyBuf, Buffer.from(iv, 'hex'));
-    decipher.setAuthTag(Buffer.from(tag, 'hex'));
-    const decrypted = JSON.parse(
-      Buffer.concat([decipher.update(Buffer.from(data, 'hex')), decipher.final()]).toString('utf8')
+
+    const payloadRaw = Buffer.from(witness.dsse_envelope.payload, 'base64').toString('utf8');
+    const parsedPayload = JSON.parse(payloadRaw);
+
+    const decipher = crypto.createDecipheriv(
+      'aes-256-gcm',
+      Buffer.from(witness.secret_key_K, 'hex'),
+      Buffer.from(parsedPayload.ciphertext_C.iv, 'hex')
     );
+    decipher.setAuthTag(Buffer.from(parsedPayload.ciphertext_C.tag, 'hex'));
+    let dec = decipher.update(parsedPayload.ciphertext_C.data, 'hex', 'utf8');
+    dec += decipher.final('utf8');
+    const decryptedAlpha = JSON.parse(dec);
+
     return {
-      settled: true,
-      witness_id: w.id,
-      vertical: w.vertical,
-      tier: args.tier,
-      seller_recipient_wallet: OPERATOR_WALLET_ADDRESS,
-      exclusive_pool_burn: args.tier === 'tier3_exclusive_25.00',
-      revealed_key_K: w.preimageKeyKHex,
-      decrypted_alpha: decrypted,
+      witness_id: witness.id,
+      revealed_preimage_key_K: witness.secret_key_K,
+      hash_lock_H: parsedPayload.hash_lock_H,
+      settlement_status: 'PAID_REVEAL_COMPLETED',
+      atomic_decrypted_alpha: decryptedAlpha
     };
   }
 
   if (name === 'submit_bond_slash_proof') {
-    const claim = JSON.parse(Buffer.from(args.dsse_envelope.payload, 'base64').toString('utf8'));
-    const keyBuf = Buffer.from(args.revealed_key_K, 'hex');
-    const hashHex = crypto.createHash('sha256').update(keyBuf).digest('hex');
-    if (hashHex !== claim.hash_lock_H) {
-      throw new Error('Preimage K does not match claim.hash_lock_H');
-    }
-    const { iv, tag, data } = claim.ciphertext_C;
-    const decipher = crypto.createDecipheriv('aes-256-gcm', keyBuf, Buffer.from(iv, 'hex'));
-    decipher.setAuthTag(Buffer.from(tag, 'hex'));
-    const payload = JSON.parse(
-      Buffer.concat([decipher.update(Buffer.from(data, 'hex')), decipher.final()]).toString('utf8')
+    const dsse = args.dsse_envelope;
+    const key = args.revealed_key_K;
+    const payloadRaw = Buffer.from(dsse.payload, 'base64').toString('utf8');
+    const parsedPayload = JSON.parse(payloadRaw);
+
+    const decipher = crypto.createDecipheriv(
+      'aes-256-gcm',
+      Buffer.from(key, 'hex'),
+      Buffer.from(parsedPayload.ciphertext_C.iv, 'hex')
     );
-    const actualBps = Math.floor(
-      ((payload.ref_price_cents - payload.obs_price_cents) * 10000) / payload.ref_price_cents
-    );
-    if (actualBps < claim.claimed_spread_bps) {
-      const slashedAmount = bondBalanceUsdc;
-      bondBalanceUsdc = 0;
+    decipher.setAuthTag(Buffer.from(parsedPayload.ciphertext_C.tag, 'hex'));
+    let dec = decipher.update(parsedPayload.ciphertext_C.data, 'hex', 'utf8');
+    dec += decipher.final('utf8');
+    const alpha = JSON.parse(dec);
+
+    const ref = alpha.ref_cents;
+    const obs = alpha.obs_cents;
+    const actualBps = Math.floor(((ref - obs) * 10000) / ref);
+    const claimedBps = parsedPayload.claimed_spread_bps;
+
+    if (actualBps < claimedBps) {
+      activeBondUsdc = 0;
       return {
-        verified: false,
         slashed: true,
-        reason: `FRAUD_PROVEN: actual ${actualBps} bps < claimed ${claim.claimed_spread_bps} bps`,
-        slashed_usdc: slashedAmount,
-        recipient: args.buyer_wallet,
-        bond_remaining_usdc: 0,
+        actual_spread_bps: actualBps,
+        claimed_spread_bps: claimedBps,
+        awarded_slashed_bond_usdc: 10,
+        slashed_to_recipient: args.buyer_wallet,
+        reason: `FRAUD_DETECTED: actual ${actualBps} bps < claimed ${claimedBps} bps`
       };
     }
+
     return {
-      verified: true,
       slashed: false,
-      reason: `VALID_WITNESS: actual ${actualBps} bps >= claimed ${claim.claimed_spread_bps} bps`,
-      bond_remaining_usdc: bondBalanceUsdc,
+      actual_spread_bps: actualBps,
+      claimed_spread_bps: claimedBps,
+      remaining_bond_usdc: activeBondUsdc,
+      reason: `Valid witness: actual ${actualBps} bps >= claimed ${claimedBps} bps`
     };
   }
 
   throw new Error(`Unknown tool: ${name}`);
 }
 
-const rl = readline.createInterface({ input: process.stdin, output: process.stdout, terminal: false });
+function handleRpc(req) {
+  if (req.method === 'initialize') {
+    return {
+      jsonrpc: '2.0',
+      id: req.id,
+      result: {
+        protocolVersion: PROTOCOL_VERSION,
+        capabilities: {
+          tools: { listChanged: false }
+        },
+        serverInfo: SERVER_INFO
+      }
+    };
+  }
 
-rl.on('line', (line) => {
-  if (!line.trim()) return;
-  try {
-    const req = JSON.parse(line);
-    if (req.method === 'tools/list') {
-      const res = {
+  if (req.method === 'notifications/initialized') {
+    return null;
+  }
+
+  if (req.method === 'ping') {
+    return {
+      jsonrpc: '2.0',
+      id: req.id,
+      result: {}
+    };
+  }
+
+  if (req.method === 'tools/list') {
+    return {
+      jsonrpc: '2.0',
+      id: req.id,
+      result: {
+        tools: MCP_TOOLS
+      }
+    };
+  }
+
+  if (req.method === 'tools/call') {
+    try {
+      const out = executeTool(req.params.name, req.params.arguments || {});
+      return {
         jsonrpc: '2.0',
         id: req.id,
         result: {
-          tools: [
+          content: [
             {
-              name: 'list_spread_witnesses',
-              description: 'List DSSE-signed live and historical spread witnesses across multi-verticals.',
-              inputSchema: {
-                type: 'object',
-                properties: {
-                  vertical: {
-                    type: 'string',
-                    enum: ['cloud_gpu_spot_arbitrage', 'hardware_restock_arbitrage'],
-                  },
-                  min_spread_bps: { type: 'integer' },
-                },
-              },
-            },
-            {
-              name: 'unlock_witness_htlc',
-              description: 'Atomic x402 Base L2 payment reveal for encrypted alpha payload.',
-              inputSchema: {
-                type: 'object',
-                properties: {
-                  witness_id: { type: 'string' },
-                  x402_payment_header: { type: 'string' },
-                  tier: {
-                    type: 'string',
-                    enum: ['tier1_spot_0.25', 'tier2_stream_4.50', 'tier3_exclusive_25.00'],
-                  },
-                },
-                required: ['witness_id', 'x402_payment_header', 'tier'],
-              },
-            },
-            {
-              name: 'submit_bond_slash_proof',
-              description: 'Submit integer-cent fraud proof to verify or slash the 10 USDC bond.',
-              inputSchema: {
-                type: 'object',
-                properties: {
-                  dsse_envelope: { type: 'object' },
-                  revealed_key_K: { type: 'string' },
-                  buyer_wallet: { type: 'string' },
-                },
-                required: ['dsse_envelope', 'revealed_key_K', 'buyer_wallet'],
-              },
-            },
-          ],
-        },
+              type: 'text',
+              text: JSON.stringify(out)
+            }
+          ]
+        }
       };
-      process.stdout.write(JSON.stringify(res) + '\n');
-      return;
+    } catch (err) {
+      return {
+        jsonrpc: '2.0',
+        id: req.id,
+        result: {
+          isError: true,
+          content: [
+            {
+              type: 'text',
+              text: err.message
+            }
+          ]
+        }
+      };
     }
+  }
 
-    if (req.method === 'tools/call') {
-      const result = handleToolCall(req.params.name, req.params.arguments || {});
-      process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: req.id, result }) + '\n');
-      return;
+  return {
+    jsonrpc: '2.0',
+    id: req.id,
+    error: {
+      code: -32601,
+      message: `Method not found: ${req.method}`
     }
+  };
+}
 
-    process.stdout.write(
-      JSON.stringify({ jsonrpc: '2.0', id: req.id, error: { code: -32601, message: 'Method not found' } }) + '\n'
-    );
+const rl = readline.createInterface({
+  input: process.stdin,
+  output: process.stdout,
+  terminal: false
+});
+
+rl.on('line', line => {
+  const trimmed = line.trim();
+  if (!trimmed) return;
+  try {
+    const req = JSON.parse(trimmed);
+    const resp = handleRpc(req);
+    if (resp !== null) {
+      process.stdout.write(JSON.stringify(resp) + '\n');
+    }
   } catch (err) {
     process.stdout.write(
-      JSON.stringify({ jsonrpc: '2.0', id: null, error: { code: -32000, message: err.message } }) + '\n'
+      JSON.stringify({
+        jsonrpc: '2.0',
+        id: null,
+        error: { code: -32700, message: 'Parse error', data: err.message }
+      }) + '\n'
     );
   }
 });

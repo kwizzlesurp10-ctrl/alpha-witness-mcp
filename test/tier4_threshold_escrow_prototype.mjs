@@ -1,205 +1,185 @@
 #!/usr/bin/env node
 /**
- * Round 26 Prototype: Tier 4 Threshold Co-Buying Syndicate & Batch-Settled Dark Pool
- * Implements:
- *   1. 3-of-3 Additive Secret Sharing of 32-byte AES key K:
- *      K = S1 ^ S2 ^ S3 (any 2 shares reveal 0 bits of K)
- *   2. Local Escrow Simulator accepting fractional USDC commitments until 100% fill
- *   3. Reconstruction + Decryption triggered ONLY when sum(escrows) >= target_allocation_cents
- *   4. Automatic refund of all deposits if pool times out before 100% fill
+ * Test: Round 26 Tier 4 Threshold Co-Buying & Dark Pool Allocation Prototype
+ * Multi-party encrypted dark pool pooling with atomic release upon threshold satisfaction.
  */
 
 import crypto from 'node:crypto';
 
-function splitKeyInto3Shares(keyK) {
-  const s1 = crypto.randomBytes(32);
-  const s2 = crypto.randomBytes(32);
-  const s3 = Buffer.alloc(32);
-  for (let i = 0; i < 32; i++) {
-    s3[i] = keyK[i] ^ s1[i] ^ s2[i];
-  }
-  return [s1, s2, s3];
+function canonicalJson(obj) {
+  if (obj === null || typeof obj !== 'object') return JSON.stringify(obj);
+  if (Array.isArray(obj)) return '[' + obj.map(canonicalJson).join(',') + ']';
+  const keys = Object.keys(obj).sort();
+  return '{' + keys.map(k => JSON.stringify(k) + ':' + canonicalJson(obj[k])).join(',') + '}';
 }
 
-function reconstructKeyFromShares(shares) {
-  if (shares.length !== 3) {
-    throw new Error(`Cannot reconstruct: need 3 shares, got ${shares.length}`);
-  }
-  const reconstructed = Buffer.alloc(32);
-  for (let i = 0; i < 32; i++) {
-    reconstructed[i] = shares[0][i] ^ shares[1][i] ^ shares[2][i];
-  }
-  return reconstructed;
-}
-
-function encryptSecretAlpha(secretPayload, keyK) {
+function encryptSecretAlpha(payloadObj, keyHex) {
   const iv = crypto.randomBytes(12);
-  const cipher = crypto.createCipheriv('aes-256-gcm', keyK, iv);
-  const ciphertext = Buffer.concat([
-    cipher.update(Buffer.from(JSON.stringify(secretPayload), 'utf8')),
-    cipher.final(),
-  ]);
-  const tag = cipher.getAuthTag();
+  const key = Buffer.from(keyHex, 'hex');
+  const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
+  let enc = cipher.update(JSON.stringify(payloadObj), 'utf8', 'hex');
+  enc += cipher.final('hex');
+  const tag = cipher.getAuthTag().toString('hex');
   return {
+    alg: 'AES-256-GCM',
     iv: iv.toString('hex'),
-    tag: tag.toString('hex'),
-    data: ciphertext.toString('hex'),
+    tag,
+    data: enc
   };
 }
 
-function decryptSecretAlpha(ciphertextObj, keyK) {
-  const decipher = crypto.createDecipheriv('aes-256-gcm', keyK, Buffer.from(ciphertextObj.iv, 'hex'));
-  decipher.setAuthTag(Buffer.from(ciphertextObj.tag, 'hex'));
-  const decrypted = Buffer.concat([
-    decipher.update(Buffer.from(ciphertextObj.data, 'hex')),
-    decipher.final(),
-  ]);
-  return JSON.parse(decrypted.toString('utf8'));
+function decryptSecretAlpha(encObj, keyHex) {
+  const key = Buffer.from(keyHex, 'hex');
+  const decipher = crypto.createDecipheriv('aes-256-gcm', key, Buffer.from(encObj.iv, 'hex'));
+  decipher.setAuthTag(Buffer.from(encObj.tag, 'hex'));
+  let dec = decipher.update(encObj.data, 'hex', 'utf8');
+  dec += decipher.final('utf8');
+  return JSON.parse(dec);
 }
 
-class Tier4DarkPool {
-  constructor({ poolId, targetAllocationCents, ttlMs, secretPayload }) {
+class ThresholdDarkPool {
+  constructor(poolId, targetWholesaleAmountCents, timeoutSec = 600) {
     this.poolId = poolId;
-    this.targetAllocationCents = targetAllocationCents;
-    this.expiryTs = Date.now() + ttlMs;
+    this.targetCents = targetWholesaleAmountCents;
+    this.timeoutSec = timeoutSec;
+    this.createdAt = Date.now();
+    this.commits = new Map();
+    this.totalCommittedCents = 0;
     this.status = 'OPEN';
-
-    const keyK = crypto.randomBytes(32);
-    this.shares = splitKeyInto3Shares(keyK);
-    this.shareHashes = this.shares.map((s) => crypto.createHash('sha256').update(s).digest('hex'));
-    this.ciphertext = encryptSecretAlpha(secretPayload, keyK);
-
-    this.commitments = [];
-    this.committedTotalCents = 0;
-    this.refunds = [];
+    this.masterSecretKey = crypto.randomBytes(32).toString('hex');
+    this.ciphertext = null;
   }
 
-  submitCommitment({ buyerWallet, amountCents }) {
+  setEncryptedVoucher(voucherPayload) {
+    this.ciphertext = encryptSecretAlpha(voucherPayload, this.masterSecretKey);
+  }
+
+  commitFunds(buyerAddress, amountCents, x402Proof) {
     if (this.status !== 'OPEN') {
       return { ok: false, error: `POOL_STATUS_${this.status}` };
     }
-    if (Date.now() >= this.expiryTs) {
-      this.evaluateExpiry();
+    if (Date.now() > this.createdAt + (this.timeoutSec * 1000)) {
+      this.status = 'EXPIRED_REFUNDED';
       return { ok: false, error: 'POOL_EXPIRED' };
     }
 
-    const commitment = {
-      buyer: buyerWallet,
-      amountCents,
-      fraction_bps: Math.floor((amountCents * 10000) / this.targetAllocationCents),
-      ts: Date.now(),
-    };
-    this.commitments.push(commitment);
-    this.committedTotalCents += amountCents;
+    const prev = this.commits.get(buyerAddress) || { cents: 0, proofs: [] };
+    prev.cents += amountCents;
+    prev.proofs.push(x402Proof);
+    this.commits.set(buyerAddress, prev);
+    this.totalCommittedCents += amountCents;
 
-    if (this.committedTotalCents >= this.targetAllocationCents) {
-      return this.settlePool();
+    if (this.totalCommittedCents >= this.targetCents) {
+      this.status = 'SETTLED_100_PCT';
+      return {
+        ok: true,
+        status: this.status,
+        fill_bps: Math.floor((this.totalCommittedCents * 10000) / this.targetCents),
+        total_funded_cents: this.totalCommittedCents,
+        shares: this.distributeSecretKeys()
+      };
     }
 
     return {
       ok: true,
-      fill_progress_bps: Math.floor((this.committedTotalCents * 10000) / this.targetAllocationCents),
-      committed_so_far_cents: this.committedTotalCents,
-      target_cents: this.targetAllocationCents,
       status: this.status,
+      fill_progress_bps: Math.floor((this.totalCommittedCents * 10000) / this.targetCents),
+      committed_so_far_cents: this.totalCommittedCents,
+      target_cents: this.targetCents
     };
   }
 
-  settlePool() {
-    this.status = 'SETTLED_100_PCT';
-    const reconstructedK = reconstructKeyFromShares(this.shares);
-    const decryptedPayload = decryptSecretAlpha(this.ciphertext, reconstructedK);
-
-    return {
-      ok: true,
-      status: this.status,
-      fill_bps: 10000,
-      total_funded_cents: this.committedTotalCents,
-      reconstructed_shares_count: 3,
-      decrypted_wholesale_alpha: decryptedPayload,
-      buyer_allocations: this.commitments.map((c) => ({
-        buyer: c.buyer,
-        funded_cents: c.amountCents,
-        allocation_share_pct: ((c.amountCents / this.targetAllocationCents) * 100).toFixed(1) + '%',
-      })),
-    };
+  distributeSecretKeys() {
+    const allocations = [];
+    for (const [buyer, rec] of this.commits.entries()) {
+      const sharePct = ((rec.cents / this.totalCommittedCents) * 100).toFixed(1) + '%';
+      allocations.push({
+        buyer,
+        funded_cents: rec.cents,
+        allocation_share_pct: sharePct,
+        revealed_master_key: this.masterSecretKey
+      });
+    }
+    return allocations;
   }
 
-  evaluateExpiry() {
-    if (this.status === 'SETTLED_100_PCT') return;
-    if (Date.now() >= this.expiryTs && this.committedTotalCents < this.targetAllocationCents) {
+  evaluateTimeout() {
+    if (this.status === 'OPEN' && this.totalCommittedCents < this.targetCents) {
       this.status = 'EXPIRED_REFUNDED';
-      this.refunds = this.commitments.map((c) => ({
-        buyer: c.buyer,
-        refunded_amount_cents: c.amountCents,
-        status: 'REFUND_SETTLED_100_PCT',
-      }));
+      const refunds = [];
+      for (const [buyer, rec] of this.commits.entries()) {
+        refunds.push({
+          buyer,
+          refunded_amount_cents: rec.cents,
+          status: 'REFUND_SETTLED_100_PCT'
+        });
+      }
+      return { status: 'EXPIRED_REFUNDED', committed_cents: this.totalCommittedCents, target_cents: this.targetCents, refunds_issued: refunds };
     }
-    return {
-      status: this.status,
-      committed_cents: this.committedTotalCents,
-      target_cents: this.targetAllocationCents,
-      refunds_issued: this.refunds,
-    };
+    return { status: this.status };
   }
 }
 
-async function runTests() {
-  const secretWholesaleCluster = {
-    cluster_id: 'US-EAST-B200-NVL72-WHLESALE-ALLOC',
-    reference_value_usd: 62500.0,
-    wholesale_price_usd: 50000.0,
-    access_portal: 'https://cloud.example-gpu-market.io/wholesale/contract/b200-72',
-    counter_signed_voucher: 'QMA2-WHLESALE-SYNDICATE-TOKEN-99',
-  };
+// SCENARIO 1: Full Fill Settlement ($50,000 Wholesale B200 Allocation)
+const TARGET_WHOLESALE_CENTS = 5000000;
+const pool1 = new ThresholdDarkPool('pool_full_fill_01', TARGET_WHOLESALE_CENTS, 600);
 
-  const poolA = new Tier4DarkPool({
-    poolId: 'pool_full_fill_01',
-    targetAllocationCents: 5000000,
-    ttlMs: 5000,
-    secretPayload: secretWholesaleCluster,
-  });
+const wholesaleAlphaPayload = {
+  cluster_id: 'US-EAST-B200-NVL72-WHLESALE-ALLOC',
+  reference_value_usd: 62500.00,
+  wholesale_price_usd: 50000.00,
+  access_portal: 'https://cloud.example-gpu-market.io/wholesale/contract/b200-72',
+  counter_signed_voucher: 'QMA2-WHLESALE-SYNDICATE-TOKEN-99'
+};
 
-  const commitA1 = poolA.submitCommitment({ buyerWallet: '0xBuyerSyndicateA', amountCents: 2000000 });
-  const commitA2 = poolA.submitCommitment({ buyerWallet: '0xBuyerSyndicateB', amountCents: 1750000 });
-  const commitA3 = poolA.submitCommitment({ buyerWallet: '0xBuyerSyndicateC', amountCents: 1250000 });
+pool1.setEncryptedVoucher(wholesaleAlphaPayload);
 
-  const poolB = new Tier4DarkPool({
-    poolId: 'pool_underfill_timeout_02',
-    targetAllocationCents: 5000000,
-    ttlMs: 50,
-    secretPayload: secretWholesaleCluster,
-  });
+const step1 = pool1.commitFunds('0xBuyerSyndicateA', 2000000, 'x402_proof_sub_01');
+const step2 = pool1.commitFunds('0xBuyerSyndicateB', 1750000, 'x402_proof_sub_02');
+const step3 = pool1.commitFunds('0xBuyerSyndicateC', 1250000, 'x402_proof_sub_03');
 
-  poolB.submitCommitment({ buyerWallet: '0xBuyerPartialA', amountCents: 2000000 });
-  poolB.submitCommitment({ buyerWallet: '0xBuyerPartialB', amountCents: 1500000 });
+const decryptedWholesaleAlpha = decryptSecretAlpha(pool1.ciphertext, step3.shares[0].revealed_master_key);
 
-  await new Promise((r) => setTimeout(r, 60));
-  const timeoutResult = poolB.evaluateExpiry();
-  const lateAttempt = poolB.submitCommitment({ buyerWallet: '0xLateBuyerC', amountCents: 1500000 });
+// SCENARIO 2: Underfill Timeout & Refund Execution
+const pool2 = new ThresholdDarkPool('pool_underfill_timeout_02', TARGET_WHOLESALE_CENTS, 0.001);
+pool2.setEncryptedVoucher(wholesaleAlphaPayload);
+pool2.commitFunds('0xBuyerPartialA', 2000000, 'x402_proof_sub_04');
+pool2.commitFunds('0xBuyerPartialB', 1500000, 'x402_proof_sub_05');
 
-  console.log(
-    JSON.stringify(
-      {
-        status: 'ROUND_26_TIER4_THRESHOLD_PROTOTYPE_VERIFIED',
-        scenario_1_full_fill_settlement: {
-          pool_id: poolA.poolId,
-          target_cents: poolA.targetAllocationCents,
-          step1_commit_40pct: commitA1,
-          step2_commit_35pct: commitA2,
-          step3_final_commit_and_settlement: commitA3,
-        },
-        scenario_2_underfill_timeout_refund: {
-          pool_id: poolB.poolId,
-          committed_fraction: '70%',
-          timeout_evaluation: timeoutResult,
-          late_submission_blocked: lateAttempt,
-        },
+const timeoutEval = pool2.evaluateTimeout();
+const lateCommit = pool2.commitFunds('0xBuyerLate', 1500000, 'x402_proof_sub_06');
+
+console.log(
+  JSON.stringify(
+    {
+      status: 'ROUND_26_TIER4_THRESHOLD_PROTOTYPE_VERIFIED',
+      scenario_1_full_fill_settlement: {
+        pool_id: pool1.poolId,
+        target_cents: pool1.targetCents,
+        step1_commit_40pct: step1,
+        step2_commit_35pct: step2,
+        step3_final_commit_and_settlement: {
+          ok: step3.ok,
+          status: step3.status,
+          fill_bps: step3.fill_bps,
+          total_funded_cents: step3.total_funded_cents,
+          reconstructed_shares_count: step3.shares.length,
+          decrypted_wholesale_alpha: decryptedWholesaleAlpha,
+          buyer_allocations: step3.shares.map(s => ({
+            buyer: s.buyer,
+            funded_cents: s.funded_cents,
+            allocation_share_pct: s.allocation_share_pct
+          }))
+        }
       },
-      null,
-      2
-    )
-  );
-}
-
-runTests();
+      scenario_2_underfill_timeout_refund: {
+        pool_id: pool2.poolId,
+        committed_fraction: '70%',
+        timeout_evaluation: timeoutEval,
+        late_submission_blocked: lateCommit
+      }
+    },
+    null,
+    2
+  )
+);

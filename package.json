@@ -4,7 +4,8 @@
   "description": "Zero-CAC Verifiable Spread Witness & Live Intent Arbitrage MCP Server (GPU Spot + Hardware Restocks) with Ed25519 DSSE commitments, 15-minute Delayed Public Proof-of-Alpha, and Base L2 x402 HTLC + 10 USDC Optimistic Slashed Bond protection.",
   "type": "module",
   "bin": {
-    "alpha-witness-mcp": "./src/pandaforge_alpha_mcp_server.mjs"
+    "alpha-witness-mcp": "./src/pandaforge_alpha_mcp_server.mjs",
+    "pandaforge-alpha-witness-mcp": "./src/pandaforge_alpha_mcp_server.mjs"
   },
   "main": "./src/pandaforge_alpha_mcp_server.mjs",
   "scripts": {
@@ -16,18 +17,28 @@
     "test:pnl": "node ./test/pnl_sensitivity_model.mjs",
     "test:kill-switch": "node ./test/kill_switch_circuit_breaker_test.mjs",
     "test:runbook": "node ./test/rearm_protocol_and_runbook_test.mjs",
-    "test": "npm run test:mvp && npm run test:verticals && npm run test:tier2-sse && npm run test:tier3-race && npm run test:pnl && npm run test:kill-switch && npm run test:runbook"
+    "test:tier4": "node ./test/tier4_threshold_escrow_prototype.mjs",
+    "test": "npm run test:mvp && npm run test:verticals && npm run test:tier2-sse && npm run test:tier3-race && npm run test:pnl && npm run test:kill-switch && npm run test:runbook && npm run test:tier4"
   },
   "keywords": [
     "mcp",
+    "model-context-protocol",
     "pandaforge",
-    "swarmscribe",
-    "qma2",
     "x402",
+    "base-l2",
+    "arbitrage",
     "dsse",
     "htlc",
-    "arbitrage",
-    "base-l2"
+    "agentcash"
   ],
-  "license": "MIT"
+  "author": "Kwizz Severson <kwizzlesurp10@gmail.com>",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/kwizzlesurp10-ctrl/alpha-witness-mcp.git"
+  },
+  "bugs": {
+    "url": "https://github.com/kwizzlesurp10-ctrl/alpha-witness-mcp/issues"
+  },
+  "homepage": "https://oasis-pearl-beam-berry.grok.me/"
 }
