@@ -1,7 +1,7 @@
 {
   "name": "@pandaforge/alpha-witness-mcp",
-  "version": "1.2.0",
-  "description": "Zero-CAC Verifiable Spread Witness & Live Intent Arbitrage MCP Server (GPU Spot + Hardware Restocks) with Ed25519 DSSE commitments, 15-minute Delayed Public Proof-of-Alpha, and Base L2 x402 HTLC + 10 USDC Optimistic Slashed Bond protection.",
+  "version": "1.3.0",
+  "description": "Zero-CAC Verifiable Spread Witness & Live Intent Arbitrage MCP Server with Live Vast.ai GPU Spot Ingestion, EIP-3009/x402 Base L2 Micropayments, Persistent Ed25519 DSSE, 15m Public Proof-of-Alpha, and Real On-Chain Bond Protection.",
   "type": "module",
   "bin": {
     "alpha-witness-mcp": "./src/pandaforge_alpha_mcp_server.mjs",
